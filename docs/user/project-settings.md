@@ -90,10 +90,9 @@ one on.
 A body signature alone lets anyone who captured a signed request send it again.
 A sender that signs a timestamp too, Stripe-style (`t=<unix seconds>,v1=<digest>`
 over `<t>.` and the body), can be checked with a tolerance: requests outside it
-are rejected, and a request sent again inside it runs once. A delivery id header,
-such as GitHub's `x-github-delivery`, makes a sender's own retries run once.
-Agents set both through `schedule_task`; the settings form keeps them when you
-edit the task.
+are rejected, and the same signed request sent again inside it runs once, so a
+sender retries by resending the request unchanged. Agents set the tolerance
+through `schedule_task`; the settings form keeps it when you edit the task.
 
 On desktop and web, pick **Deliveries** from a task's menu to see recent
 requests and the prompt each one produced.

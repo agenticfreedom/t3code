@@ -80,11 +80,8 @@ export interface DraftState {
   readonly signaturePrefix: string;
   /** Write-only: empty keeps the secret already stored on the server. */
   readonly signatureSecret: string;
-  /** Replay settings an agent set; the form does not edit them, and saving keeps them. */
-  readonly signatureReplay: Pick<
-    ScheduledTaskWebhookSignature,
-    "timestampToleranceSeconds" | "deliveryIdHeader"
-  >;
+  /** A signed-timestamp setting an agent set; the form does not edit it, and saving keeps it. */
+  readonly signatureReplay: Pick<ScheduledTaskWebhookSignature, "timestampToleranceSeconds">;
   /** Minutes as typed; empty runs every held request regardless of age. */
   readonly maxDeliveryAgeMinutes: string;
 }
@@ -171,15 +168,8 @@ export function taskToDraft(task: ScheduledTask): DraftState {
       : { signatureEnabled: false, ...WEBHOOK_SIGNATURE_DEFAULTS }),
     signatureSecret: "",
     signatureReplay:
-      schedule.type === "webhook" && schedule.signature !== null
-        ? {
-            ...(schedule.signature.timestampToleranceSeconds == null
-              ? {}
-              : { timestampToleranceSeconds: schedule.signature.timestampToleranceSeconds }),
-            ...(schedule.signature.deliveryIdHeader == null
-              ? {}
-              : { deliveryIdHeader: schedule.signature.deliveryIdHeader }),
-          }
+      schedule.type === "webhook" && schedule.signature?.timestampToleranceSeconds != null
+        ? { timestampToleranceSeconds: schedule.signature.timestampToleranceSeconds }
         : {},
     maxDeliveryAgeMinutes:
       schedule.type === "webhook" && schedule.maxDeliveryAgeMinutes != null

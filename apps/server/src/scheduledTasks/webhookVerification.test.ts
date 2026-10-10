@@ -65,7 +65,6 @@ describe("checkWebhookSignature with a signed timestamp", () => {
     encoding: "hex",
     prefix: "",
     timestampToleranceSeconds: 300,
-    deliveryIdHeader: "webhook-id",
   } as const;
   const nowMs = 1_800_000_000_000;
   const t = String(nowMs / 1000);
@@ -74,11 +73,11 @@ describe("checkWebhookSignature with a signed timestamp", () => {
   const check = (headers: Record<string, string>, at = nowMs) =>
     checkWebhookSignature({ signature: stripe, secret, headers, body, nowMs: at });
 
-  it("accepts t and v1 over the timestamp and body, and keys it by both and by the delivery id", () => {
+  it("accepts t and v1 over the timestamp and body, and keys it by both", () => {
     const digest = sign(t);
-    assert.deepStrictEqual(check({ "x-signature": `t=${t},v1=${digest}`, "webhook-id": "evt_1" }), {
+    assert.deepStrictEqual(check({ "x-signature": `t=${t},v1=${digest}` }), {
       _tag: "verified",
-      replayKeys: [`signature:${t}.${digest}`, "delivery:evt_1"],
+      replayKey: `${t}.${digest}`,
     });
   });
 
@@ -110,22 +109,17 @@ describe("checkWebhookSignature with a signed timestamp", () => {
     }
   });
 
-  it("names the delivery id only for a body-only signature that verified", () => {
+  it("gives a body-only signature no replay key: identical bodies may be sent twice", () => {
     const signature = { ...stripe, timestampToleranceSeconds: null };
-    const valid = { "x-signature": hmac().digest("hex"), "webhook-id": "evt_2" };
-    assert.deepStrictEqual(
-      checkWebhookSignature({ signature, secret, headers: valid, body, nowMs }),
-      { _tag: "verified", replayKeys: ["delivery:evt_2"] },
-    );
     assert.deepStrictEqual(
       checkWebhookSignature({
         signature,
-        secret: "other",
-        headers: valid,
+        secret,
+        headers: { "x-signature": hmac().digest("hex") },
         body,
         nowMs,
       }),
-      { _tag: "rejected" },
+      { _tag: "verified", replayKey: undefined },
     );
   });
 });

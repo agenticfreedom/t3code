@@ -1042,12 +1042,6 @@ export const layer = Layer.effect(
                               timestampToleranceSeconds:
                                 input.schedule.signature.timestampToleranceSeconds,
                             }),
-                        ...(input.schedule.signature.deliveryIdHeader == null
-                          ? {}
-                          : {
-                              deliveryIdHeader:
-                                input.schedule.signature.deliveryIdHeader.toLowerCase(),
-                            }),
                       },
                 maxDeliveryAgeMinutes: input.schedule.maxDeliveryAgeMinutes ?? null,
               }
@@ -1557,7 +1551,7 @@ export const layer = Layer.effect(
               return { _tag: "disabled" as const };
             }
             const signature = schedule.signature;
-            let replayKeys: ReadonlyArray<string> = [];
+            let replayKey: string | undefined;
             if (signature !== null) {
               const verdict =
                 row.webhook_secret === null
@@ -1574,7 +1568,7 @@ export const layer = Layer.effect(
                 yield* observe("rejected_signature");
                 return { _tag: "rejected_signature" as const };
               }
-              replayKeys = verdict.replayKeys;
+              replayKey = verdict.replayKey;
             }
             const maxAgeMinutes = schedule.maxDeliveryAgeMinutes ?? null;
             if (
@@ -1585,44 +1579,6 @@ export const layer = Layer.effect(
               yield* log("expired", { signatureVerified: signature !== null });
               yield* observe("expired");
               return { _tag: "expired" as const };
-            }
-
-            // A verified request the sender already delivered (an exact resend
-            // inside the timestamp tolerance, or its own retry under the same
-            // delivery id) runs once. Claimed only after the signature passed,
-            // so nobody can use up an id they cannot sign for.
-            if (replayKeys.length > 0) {
-              // One transaction, so two copies arriving together cannot both claim.
-              const duplicate = yield* Effect.gen(function* () {
-                const seen = yield* sql<{ claim_key: string }>`
-                  SELECT claim_key FROM scheduled_task_webhook_sender_deliveries
-                  WHERE task_id = ${task.id} AND ${sql.in("claim_key", replayKeys)}
-                `;
-                if (seen.length > 0) return true;
-                for (const claimKey of replayKeys) {
-                  yield* sql`
-                    INSERT INTO scheduled_task_webhook_sender_deliveries
-                      (task_id, claim_key, seen_at)
-                    VALUES (${task.id}, ${claimKey}, ${iso(now)})
-                  `;
-                }
-                return false;
-              }).pipe(
-                sql.withTransaction,
-                Effect.mapError((cause) =>
-                  taskError("Could not record webhook delivery.", { taskId: task.id, cause }),
-                ),
-              );
-              if (duplicate) {
-                // Already run, so a relay claim taken above stays: it is spent.
-                yield* observe("duplicate");
-                return { _tag: "accepted" as const, deliveryId, outcome: "duplicate" as const };
-              }
-              // Kept longer than any tolerance and than a sender's retries last.
-              yield* sql`
-                DELETE FROM scheduled_task_webhook_sender_deliveries
-                WHERE seen_at < ${iso(DateTime.subtract(now, { hours: 48 }))}
-              `.pipe(Effect.ignore);
             }
 
             const rendered = renderWebhookPrompt(task.prompt, request);
@@ -1651,14 +1607,7 @@ export const layer = Layer.effect(
             });
             if (!queued) {
               // The task is busy with WEBHOOK_MAX_QUEUED_PER_TASK deliveries already.
-              // Its sender may retry, so the replay claims are given back too.
               yield* observe("queue_full");
-              if (replayKeys.length > 0) {
-                yield* sql`
-                  DELETE FROM scheduled_task_webhook_sender_deliveries
-                  WHERE task_id = ${task.id} AND ${sql.in("claim_key", replayKeys)}
-                `.pipe(Effect.ignore);
-              }
               return yield* releaseClaim({
                 _tag: "rate_limited" as const,
                 outcome: "queue_full" as const,
@@ -1673,6 +1622,35 @@ export const layer = Layer.effect(
               else next.set(queueKey, count);
               return next;
             });
+            // A request signed with a timestamp runs once: the same signed
+            // request sent again (a retry, or a replay inside the tolerance) is a
+            // duplicate. Claimed only once it holds a queue slot, so a copy that
+            // is turned away never leaves a claim behind that suppresses the one
+            // that would have run.
+            if (replayKey !== undefined) {
+              const claimed = yield* sql<{ claim_key: string }>`
+                INSERT INTO scheduled_task_webhook_sender_deliveries (task_id, claim_key, seen_at)
+                VALUES (${task.id}, ${replayKey}, ${iso(now)})
+                ON CONFLICT (task_id, claim_key) DO NOTHING
+                RETURNING claim_key
+              `.pipe(
+                Effect.mapError((cause) =>
+                  taskError("Could not record webhook delivery.", { taskId: task.id, cause }),
+                ),
+                Effect.onError(() => release),
+              );
+              if (claimed.length === 0) {
+                // Already run, so a relay claim taken above stays: it is spent.
+                yield* release;
+                yield* observe("duplicate");
+                return { _tag: "accepted" as const, deliveryId, outcome: "duplicate" as const };
+              }
+              // Kept longer than the largest tolerance.
+              yield* sql`
+                DELETE FROM scheduled_task_webhook_sender_deliveries
+                WHERE seen_at < ${iso(DateTime.subtract(now, { hours: 48 }))}
+              `.pipe(Effect.ignore);
+            }
             yield* log("accepted", {
               signatureVerified: signature !== null,
               missing: rendered.missing,

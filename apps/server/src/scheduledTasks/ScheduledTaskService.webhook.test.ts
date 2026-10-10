@@ -966,39 +966,50 @@ it.effect("refuses a signed timestamp outside the tolerance", () =>
   ),
 );
 
-it.effect("a sender's retry under the same delivery id runs once; another id runs", () =>
-  withService(({ service, launches }) =>
-    Effect.gen(function* () {
-      const { task } = yield* service.upsert(
-        yield* webhookTaskInput({
-          schedule: {
-            type: "webhook",
-            signature: {
-              header: "x-hub-signature-256",
-              encoding: "hex",
-              prefix: "sha256=",
-              deliveryIdHeader: "X-GitHub-Delivery",
-              secret: "s3cret",
-            },
-          },
+it.effect("two copies racing for the last queue slot: one runs, the other is turned away", () =>
+  Effect.gen(function* () {
+    const gate = yield* Deferred.make<void>();
+    yield* withService(
+      ({ service, launches }) =>
+        Effect.gen(function* () {
+          const { task } = yield* service.upsert(
+            yield* webhookTaskInput({
+              schedule: { type: "webhook", signature: { ...stripeSignature, secret: "s3cret" } },
+            }),
+          );
+          const send = (id: string, relayDeliveryId?: string) =>
+            Effect.flatMap(nowSeconds, (seconds) => {
+              const body = new TextEncoder().encode(JSON.stringify({ id }));
+              return service.triggerWebhook(
+                requestFor(task, {
+                  headers: { "x-signature": signTimestamped(seconds, body) },
+                  body,
+                  bodyText: new TextDecoder().decode(body),
+                  ...(relayDeliveryId ? { relayDeliveryId } : {}),
+                }),
+              );
+            });
+          yield* send("first");
+          yield* Queue.take(launches);
+          // 18 wait behind the running one, leaving one slot.
+          yield* Effect.forEach(
+            Array.from({ length: 18 }, (_, index) => `wait-${index}`),
+            (id) => send(id),
+          );
+          const copies = yield* Effect.forEach(
+            ["relay-a", "relay-b"],
+            (relayDeliveryId) => send("late", relayDeliveryId),
+            { concurrency: "unbounded" },
+          );
+          const outcome = (result: ScheduledTaskService.WebhookTriggerResult) =>
+            result._tag === "accepted" ? result.outcome : result._tag;
+          // Never both a duplicate and a refusal: that would lose the delivery.
+          assert.deepEqual(copies.map(outcome).toSorted(), ["accepted", "rate_limited"]);
+          yield* Deferred.succeed(gate, undefined);
         }),
-      );
-      const signature = `sha256=${NodeCrypto.createHmac("sha256", "s3cret").update(pullRequestBody).digest("hex")}`;
-      const send = (id: string) =>
-        service.triggerWebhook(
-          requestFor(task, {
-            headers: { "x-hub-signature-256": signature, "x-github-delivery": id },
-          }),
-        );
-      const outcome = (result: ScheduledTaskService.WebhookTriggerResult) =>
-        result._tag === "accepted" ? result.outcome : result._tag;
-      assert.equal(outcome(yield* send("d-1")), "accepted");
-      assert.equal(outcome(yield* send("d-1")), "duplicate");
-      assert.equal(outcome(yield* send("d-2")), "accepted");
-      yield* Queue.take(launches);
-      yield* Queue.take(launches);
-    }),
-  ),
+      { gate },
+    );
+  }),
 );
 
 it.effect(
@@ -1015,7 +1026,6 @@ it.effect(
                   type: "webhook",
                   signature: {
                     ...stripeSignature,
-                    deliveryIdHeader: "webhook-id",
                     secret: "s3cret",
                   },
                 },
@@ -1028,7 +1038,7 @@ it.effect(
                 const body = new TextEncoder().encode(JSON.stringify({ id }));
                 return service.triggerWebhook(
                   requestFor(task, {
-                    headers: { "x-signature": signTimestamped(seconds, body), "webhook-id": id },
+                    headers: { "x-signature": signTimestamped(seconds, body) },
                     body,
                     bodyText: new TextDecoder().decode(body),
                   }),

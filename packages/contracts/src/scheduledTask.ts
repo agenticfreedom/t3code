@@ -71,11 +71,7 @@ const ScheduledTaskWebhookSignatureFields = {
     Schema.NullOr(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 3600 }))),
   ).annotate({
     description:
-      "Expect a Stripe-style signed timestamp: the header (after the prefix) is 't=<unix seconds>,v1=<digest>', the digest is over '<t>.' followed by the raw body, and t must be within this many seconds of now. A request is then run once even if it is sent again. Null signs the body alone.",
-  }),
-  deliveryIdHeader: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)).annotate({
-    description:
-      "Request header carrying the sender's delivery id, such as webhook-id. A verified request whose id was already run is answered as a duplicate and not run again. Null for none.",
+      "Expect a Stripe-style signed timestamp: the header (after the prefix) is 't=<unix seconds>,v1=<digest>', the digest is over '<t>.' followed by the raw body, and t must be within this many seconds of now. A verified request runs once: sending the same signed request again, as a retry, is answered as a duplicate. Null signs the body alone.",
   }),
 };
 

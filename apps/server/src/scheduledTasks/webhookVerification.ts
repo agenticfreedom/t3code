@@ -18,13 +18,13 @@ type SignatureInput = {
 };
 
 /**
- * What a verified request may be deduplicated by: the signed timestamp and
- * digest (an exact resend inside the tolerance), and the sender's delivery id
- * (its own retry, signed afresh). Both are absent for a body-only signature
- * without a delivery id header.
+ * A verified request, and for a signed timestamp the key it runs once under:
+ * its timestamp and digest, so the same signed request sent again (a retry, or
+ * a replay inside the tolerance) is recognised. A body-only signature has no
+ * such key: identical bodies may legitimately be sent twice.
  */
 export type WebhookSignatureVerdict =
-  | { readonly _tag: "verified"; readonly replayKeys: ReadonlyArray<string> }
+  | { readonly _tag: "verified"; readonly replayKey: string | undefined }
   | { readonly _tag: "rejected" };
 
 const encode = (signature: ScheduledTaskWebhookSignature, digest: Buffer) =>
@@ -101,28 +101,18 @@ export function verifyTimestampedWebhookSignature(
   return matched ? { timestamp, digest } : undefined;
 }
 
-/**
- * Verifies a request against the task's signature settings and names the keys
- * it may be deduplicated by. The delivery id is trusted only after the
- * signature passed; on its own it is just a header anyone can set, which is why
- * a timestamped request is also keyed by its signed timestamp and digest.
- */
+/** Verifies a request against the task's signature settings. */
 export function checkWebhookSignature(
   input: SignatureInput & { readonly nowMs: number },
 ): WebhookSignatureVerdict {
   const tolerance = input.signature.timestampToleranceSeconds ?? null;
-  const replayKeys: Array<string> = [];
   if (tolerance === null) {
-    if (!verifyWebhookSignature(input)) return { _tag: "rejected" };
-  } else {
-    const verified = verifyTimestampedWebhookSignature({ ...input, toleranceSeconds: tolerance });
-    if (verified === undefined) return { _tag: "rejected" };
-    replayKeys.push(`signature:${verified.timestamp}.${verified.digest}`);
+    return verifyWebhookSignature(input)
+      ? { _tag: "verified", replayKey: undefined }
+      : { _tag: "rejected" };
   }
-  const idHeader = input.signature.deliveryIdHeader ?? null;
-  const deliveryId = idHeader === null ? undefined : input.headers[idHeader.toLowerCase()]?.trim();
-  if (deliveryId !== undefined && deliveryId !== "") {
-    replayKeys.push(`delivery:${deliveryId.slice(0, 256)}`);
-  }
-  return { _tag: "verified", replayKeys };
+  const verified = verifyTimestampedWebhookSignature({ ...input, toleranceSeconds: tolerance });
+  return verified === undefined
+    ? { _tag: "rejected" }
+    : { _tag: "verified", replayKey: `${verified.timestamp}.${verified.digest}` };
 }

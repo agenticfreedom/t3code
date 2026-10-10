@@ -193,8 +193,8 @@ describe("webhook scheduled tasks", () => {
     });
   });
 
-  it("keeps a signed timestamp and delivery id header the form does not show", () => {
-    const replay = { ...signature, timestampToleranceSeconds: 300, deliveryIdHeader: "webhook-id" };
+  it("keeps a signed-timestamp tolerance the form does not show", () => {
+    const replay = { ...signature, timestampToleranceSeconds: 300 };
     const draft = taskToDraft({ ...webhookTask, schedule: { type: "webhook", signature: replay } });
     expect(scheduleFromDraft({ ...draft, title: "Edited" })).toEqual({
       type: "webhook",
