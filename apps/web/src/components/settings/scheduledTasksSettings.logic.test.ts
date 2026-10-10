@@ -193,6 +193,16 @@ describe("webhook scheduled tasks", () => {
     });
   });
 
+  it("keeps a signed timestamp and delivery id header the form does not show", () => {
+    const replay = { ...signature, timestampToleranceSeconds: 300, deliveryIdHeader: "webhook-id" };
+    const draft = taskToDraft({ ...webhookTask, schedule: { type: "webhook", signature: replay } });
+    expect(scheduleFromDraft({ ...draft, title: "Edited" })).toEqual({
+      type: "webhook",
+      signature: replay,
+      maxDeliveryAgeMinutes: null,
+    });
+  });
+
   it("drops the signature when it is switched off and offers GitHub's settings", () => {
     const draft = taskToDraft({ ...webhookTask, schedule: { type: "webhook", signature: null } });
     expect(draft.signatureEnabled).toBe(false);

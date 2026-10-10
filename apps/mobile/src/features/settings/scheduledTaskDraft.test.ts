@@ -65,6 +65,19 @@ describe("scheduleDraftForTask", () => {
     expect(saved).toEqual({ type: "webhook", signature, maxDeliveryAgeMinutes: null });
     expect(saved?.type === "webhook" && saved.signature && "secret" in saved.signature).toBe(false);
   });
+
+  it("keeps a signed timestamp and delivery id header set elsewhere", () => {
+    const signature = {
+      header: "x-signature",
+      encoding: "hex" as const,
+      prefix: "",
+      timestampToleranceSeconds: 300,
+      deliveryIdHeader: "webhook-id",
+    };
+    expect(
+      scheduleFromDraft(scheduleDraftForTask({ schedule: { type: "webhook", signature } })),
+    ).toEqual({ type: "webhook", signature, maxDeliveryAgeMinutes: null });
+  });
 });
 
 describe("hasScheduledTaskDraftChanges", () => {

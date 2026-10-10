@@ -895,3 +895,157 @@ it.effect("counts each handled request by what happened to it", () =>
     }),
   ),
 );
+
+const stripeSignature = {
+  header: "x-signature",
+  encoding: "hex",
+  prefix: "",
+  timestampToleranceSeconds: 300,
+} as const;
+
+const signTimestamped = (timestamp: number, payload: Uint8Array = pullRequestBody) =>
+  `t=${timestamp},v1=${NodeCrypto.createHmac("sha256", "s3cret").update(`${timestamp}.`).update(payload).digest("hex")}`;
+
+const nowSeconds = Effect.map(DateTime.now, (now) =>
+  Math.floor(DateTime.toEpochMillis(now) / 1000),
+);
+
+it.effect("runs a request with a signed timestamp once, even when it is sent again", () =>
+  withService(({ service, launches }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(
+        yield* webhookTaskInput({
+          schedule: { type: "webhook", signature: { ...stripeSignature, secret: "s3cret" } },
+        }),
+      );
+      assert.deepEqual(task.schedule, {
+        type: "webhook",
+        signature: stripeSignature,
+        maxDeliveryAgeMinutes: null,
+      });
+      const headers = {
+        "content-type": "application/json",
+        "x-signature": signTimestamped(yield* nowSeconds),
+      };
+      const first = yield* service.triggerWebhook(requestFor(task, { headers }));
+      const replayed = yield* service.triggerWebhook(requestFor(task, { headers }));
+      assert.equal(first._tag, "accepted");
+      assert.deepEqual(
+        replayed._tag === "accepted" ? replayed.outcome : replayed._tag,
+        "duplicate",
+      );
+      yield* Queue.take(launches);
+      assert.equal(yield* Queue.size(launches), 0);
+      // The same body signed at a later second is a new delivery.
+      const resigned = yield* service.triggerWebhook(
+        requestFor(task, {
+          headers: { ...headers, "x-signature": signTimestamped((yield* nowSeconds) + 1) },
+        }),
+      );
+      assert.equal(resigned._tag === "accepted" ? resigned.outcome : resigned._tag, "accepted");
+    }),
+  ),
+);
+
+it.effect("refuses a signed timestamp outside the tolerance", () =>
+  withService(({ service }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(
+        yield* webhookTaskInput({
+          schedule: { type: "webhook", signature: { ...stripeSignature, secret: "s3cret" } },
+        }),
+      );
+      yield* TestClock.adjust("1 hour");
+      const stale = yield* service.triggerWebhook(
+        requestFor(task, {
+          headers: { "x-signature": signTimestamped((yield* nowSeconds) - 301) },
+        }),
+      );
+      assert.equal(stale._tag, "rejected_signature");
+    }),
+  ),
+);
+
+it.effect("a sender's retry under the same delivery id runs once; another id runs", () =>
+  withService(({ service, launches }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(
+        yield* webhookTaskInput({
+          schedule: {
+            type: "webhook",
+            signature: {
+              header: "x-hub-signature-256",
+              encoding: "hex",
+              prefix: "sha256=",
+              deliveryIdHeader: "X-GitHub-Delivery",
+              secret: "s3cret",
+            },
+          },
+        }),
+      );
+      const signature = `sha256=${NodeCrypto.createHmac("sha256", "s3cret").update(pullRequestBody).digest("hex")}`;
+      const send = (id: string) =>
+        service.triggerWebhook(
+          requestFor(task, {
+            headers: { "x-hub-signature-256": signature, "x-github-delivery": id },
+          }),
+        );
+      const outcome = (result: ScheduledTaskService.WebhookTriggerResult) =>
+        result._tag === "accepted" ? result.outcome : result._tag;
+      assert.equal(outcome(yield* send("d-1")), "accepted");
+      assert.equal(outcome(yield* send("d-1")), "duplicate");
+      assert.equal(outcome(yield* send("d-2")), "accepted");
+      yield* Queue.take(launches);
+      yield* Queue.take(launches);
+    }),
+  ),
+);
+
+it.effect(
+  "a delivery turned away by a full queue keeps no claim, so its retry is not a duplicate",
+  () =>
+    Effect.gen(function* () {
+      const gate = yield* Deferred.make<void>();
+      yield* withService(
+        ({ service, launches }) =>
+          Effect.gen(function* () {
+            const { task } = yield* service.upsert(
+              yield* webhookTaskInput({
+                schedule: {
+                  type: "webhook",
+                  signature: {
+                    ...stripeSignature,
+                    deliveryIdHeader: "webhook-id",
+                    secret: "s3cret",
+                  },
+                },
+              }),
+            );
+            // Each delivery has its own body: two identical bodies signed in the same
+            // second are one request sent twice.
+            const send = (id: string) =>
+              Effect.flatMap(nowSeconds, (seconds) => {
+                const body = new TextEncoder().encode(JSON.stringify({ id }));
+                return service.triggerWebhook(
+                  requestFor(task, {
+                    headers: { "x-signature": signTimestamped(seconds, body), "webhook-id": id },
+                    body,
+                    bodyText: new TextDecoder().decode(body),
+                  }),
+                );
+              });
+            yield* send("first");
+            yield* Queue.take(launches);
+            yield* Effect.forEach(
+              Array.from({ length: 19 }, (_, index) => `wait-${index}`),
+              send,
+            );
+            assert.equal((yield* send("late"))._tag, "rate_limited");
+            // Still full; refused again rather than answered as already run.
+            assert.equal((yield* send("late"))._tag, "rate_limited");
+            yield* Deferred.succeed(gate, undefined);
+          }),
+        { gate },
+      );
+    }),
+);

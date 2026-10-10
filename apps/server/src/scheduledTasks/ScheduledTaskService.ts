@@ -52,7 +52,7 @@ import {
   renderWebhookPrompt,
   type WebhookRequest,
 } from "./webhookTemplate.ts";
-import { constantTimeEquals, verifyWebhookSignature } from "./webhookVerification.ts";
+import { checkWebhookSignature, constantTimeEquals } from "./webhookVerification.ts";
 
 /** Path prefix of the environment route that receives webhook requests. */
 export const WEBHOOK_ROUTE_PREFIX = "/api/hooks";
@@ -619,6 +619,9 @@ export const layer = Layer.effect(
       sql
         .withTransaction(
           sql`DELETE FROM scheduled_task_webhook_deliveries WHERE task_id = ${id}`.pipe(
+            Effect.andThen(
+              sql`DELETE FROM scheduled_task_webhook_sender_deliveries WHERE task_id = ${id}`,
+            ),
             Effect.andThen(sql`DELETE FROM scheduled_tasks WHERE task_id = ${id}`),
           ),
         )
@@ -1032,6 +1035,19 @@ export const layer = Layer.effect(
                         header: input.schedule.signature.header.toLowerCase(),
                         encoding: input.schedule.signature.encoding,
                         prefix: input.schedule.signature.prefix,
+                        // Absent unless set, so a body-only signature reads as before.
+                        ...(input.schedule.signature.timestampToleranceSeconds == null
+                          ? {}
+                          : {
+                              timestampToleranceSeconds:
+                                input.schedule.signature.timestampToleranceSeconds,
+                            }),
+                        ...(input.schedule.signature.deliveryIdHeader == null
+                          ? {}
+                          : {
+                              deliveryIdHeader:
+                                input.schedule.signature.deliveryIdHeader.toLowerCase(),
+                            }),
                       },
                 maxDeliveryAgeMinutes: input.schedule.maxDeliveryAgeMinutes ?? null,
               }
@@ -1541,20 +1557,24 @@ export const layer = Layer.effect(
               return { _tag: "disabled" as const };
             }
             const signature = schedule.signature;
+            let replayKeys: ReadonlyArray<string> = [];
             if (signature !== null) {
-              const verified =
-                row.webhook_secret !== null &&
-                verifyWebhookSignature({
-                  signature,
-                  secret: row.webhook_secret,
-                  headers: request.headers,
-                  body: request.body,
-                });
-              if (!verified) {
+              const verdict =
+                row.webhook_secret === null
+                  ? ({ _tag: "rejected" } as const)
+                  : checkWebhookSignature({
+                      signature,
+                      secret: row.webhook_secret,
+                      headers: request.headers,
+                      body: request.body,
+                      nowMs: DateTime.toEpochMillis(now),
+                    });
+              if (verdict._tag === "rejected") {
                 yield* log("rejected_signature");
                 yield* observe("rejected_signature");
                 return { _tag: "rejected_signature" as const };
               }
+              replayKeys = verdict.replayKeys;
             }
             const maxAgeMinutes = schedule.maxDeliveryAgeMinutes ?? null;
             if (
@@ -1565,6 +1585,44 @@ export const layer = Layer.effect(
               yield* log("expired", { signatureVerified: signature !== null });
               yield* observe("expired");
               return { _tag: "expired" as const };
+            }
+
+            // A verified request the sender already delivered (an exact resend
+            // inside the timestamp tolerance, or its own retry under the same
+            // delivery id) runs once. Claimed only after the signature passed,
+            // so nobody can use up an id they cannot sign for.
+            if (replayKeys.length > 0) {
+              // One transaction, so two copies arriving together cannot both claim.
+              const duplicate = yield* Effect.gen(function* () {
+                const seen = yield* sql<{ claim_key: string }>`
+                  SELECT claim_key FROM scheduled_task_webhook_sender_deliveries
+                  WHERE task_id = ${task.id} AND ${sql.in("claim_key", replayKeys)}
+                `;
+                if (seen.length > 0) return true;
+                for (const claimKey of replayKeys) {
+                  yield* sql`
+                    INSERT INTO scheduled_task_webhook_sender_deliveries
+                      (task_id, claim_key, seen_at)
+                    VALUES (${task.id}, ${claimKey}, ${iso(now)})
+                  `;
+                }
+                return false;
+              }).pipe(
+                sql.withTransaction,
+                Effect.mapError((cause) =>
+                  taskError("Could not record webhook delivery.", { taskId: task.id, cause }),
+                ),
+              );
+              if (duplicate) {
+                // Already run, so a relay claim taken above stays: it is spent.
+                yield* observe("duplicate");
+                return { _tag: "accepted" as const, deliveryId, outcome: "duplicate" as const };
+              }
+              // Kept longer than any tolerance and than a sender's retries last.
+              yield* sql`
+                DELETE FROM scheduled_task_webhook_sender_deliveries
+                WHERE seen_at < ${iso(DateTime.subtract(now, { hours: 48 }))}
+              `.pipe(Effect.ignore);
             }
 
             const rendered = renderWebhookPrompt(task.prompt, request);
@@ -1593,7 +1651,14 @@ export const layer = Layer.effect(
             });
             if (!queued) {
               // The task is busy with WEBHOOK_MAX_QUEUED_PER_TASK deliveries already.
+              // Its sender may retry, so the replay claims are given back too.
               yield* observe("queue_full");
+              if (replayKeys.length > 0) {
+                yield* sql`
+                  DELETE FROM scheduled_task_webhook_sender_deliveries
+                  WHERE task_id = ${task.id} AND ${sql.in("claim_key", replayKeys)}
+                `.pipe(Effect.ignore);
+              }
               return yield* releaseClaim({
                 _tag: "rate_limited" as const,
                 outcome: "queue_full" as const,

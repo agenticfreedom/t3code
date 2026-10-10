@@ -97,11 +97,8 @@ export function scheduleFromDraft(draft: ScheduleDraft): ScheduledTaskUpsertSche
       signature:
         draft.signature === null
           ? null
-          : {
-              header: draft.signature.header,
-              encoding: draft.signature.encoding,
-              prefix: draft.signature.prefix,
-            },
+          : // The whole check, so replay settings an agent set are kept too.
+            { ...draft.signature },
       maxDeliveryAgeMinutes,
     };
   }

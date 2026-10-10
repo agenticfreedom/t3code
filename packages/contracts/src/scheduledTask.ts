@@ -66,12 +66,26 @@ const ScheduledTaskWebhookSignatureFields = {
   prefix: Schema.String.annotate({
     description: "Text before the digest in the header value, such as 'sha256='. Empty for none.",
   }),
+  // Optional so rows saved before these settings existed still decode.
+  timestampToleranceSeconds: Schema.optional(
+    Schema.NullOr(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 3600 }))),
+  ).annotate({
+    description:
+      "Expect a Stripe-style signed timestamp: the header (after the prefix) is 't=<unix seconds>,v1=<digest>', the digest is over '<t>.' followed by the raw body, and t must be within this many seconds of now. A request is then run once even if it is sent again. Null signs the body alone.",
+  }),
+  deliveryIdHeader: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)).annotate({
+    description:
+      "Request header carrying the sender's delivery id, such as webhook-id. A verified request whose id was already run is answered as a duplicate and not run again. Null for none.",
+  }),
 };
 
 /** HMAC-SHA256 over the raw request body. The secret is never part of the read model. */
 export const ScheduledTaskWebhookSignature = Schema.Struct(
   ScheduledTaskWebhookSignatureFields,
-).annotate({ description: "Optional HMAC-SHA256 signature check over the raw request body." });
+).annotate({
+  description:
+    "Optional HMAC-SHA256 signature check over the raw request body, or over a signed timestamp and the body.",
+});
 export type ScheduledTaskWebhookSignature = typeof ScheduledTaskWebhookSignature.Type;
 
 /** Matches how long the relay holds a request for an offline environment. */
