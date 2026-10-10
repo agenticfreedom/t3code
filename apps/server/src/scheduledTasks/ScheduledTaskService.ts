@@ -1624,38 +1624,51 @@ export const layer = Layer.effect(
             });
             // A request signed with a timestamp runs once: the same signed
             // request sent again (a retry, or a replay inside the tolerance) is a
-            // duplicate. Claimed only once it holds a queue slot, so a copy that
-            // is turned away never leaves a claim behind that suppresses the one
-            // that would have run.
-            if (replayKey !== undefined) {
-              const claimed = yield* sql<{ claim_key: string }>`
-                INSERT INTO scheduled_task_webhook_sender_deliveries (task_id, claim_key, seen_at)
-                VALUES (${task.id}, ${replayKey}, ${iso(now)})
-                ON CONFLICT (task_id, claim_key) DO NOTHING
-                RETURNING claim_key
-              `.pipe(
-                Effect.mapError((cause) =>
-                  taskError("Could not record webhook delivery.", { taskId: task.id, cause }),
-                ),
-                Effect.onError(() => release),
-              );
-              if (claimed.length === 0) {
-                // Already run, so a relay claim taken above stays: it is spent.
-                yield* release;
-                yield* observe("duplicate");
-                return { _tag: "accepted" as const, deliveryId, outcome: "duplicate" as const };
+            // duplicate. Claimed only once it holds a queue slot, and in one
+            // transaction with its delivery log, so neither a copy turned away
+            // nor a failed write leaves a claim that suppresses the retry.
+            const admitted = yield* Effect.gen(function* () {
+              if (replayKey !== undefined) {
+                const claimed = yield* sql<{ claim_key: string }>`
+                  INSERT INTO scheduled_task_webhook_sender_deliveries (task_id, claim_key, seen_at)
+                  VALUES (${task.id}, ${replayKey}, ${iso(now)})
+                  ON CONFLICT (task_id, claim_key) DO NOTHING
+                  RETURNING claim_key
+                `.pipe(
+                  Effect.mapError((cause) =>
+                    taskError("Could not record webhook delivery.", { taskId: task.id, cause }),
+                  ),
+                );
+                if (claimed.length === 0) return false;
               }
+              yield* log("accepted", {
+                signatureVerified: signature !== null,
+                missing: rendered.missing,
+                renderedPrompt: rendered.prompt,
+              });
+              return true;
+            }).pipe(
+              sql.withTransaction,
+              Effect.mapError((cause) =>
+                cause._tag === "ScheduledTaskError"
+                  ? cause
+                  : taskError("Could not record webhook delivery.", { taskId: task.id, cause }),
+              ),
+              Effect.onError(() => Effect.andThen(release, releaseClaim(undefined))),
+            );
+            if (!admitted) {
+              // Already run, so a relay claim taken above stays: it is spent.
+              yield* release;
+              yield* observe("duplicate");
+              return { _tag: "accepted" as const, deliveryId, outcome: "duplicate" as const };
+            }
+            if (replayKey !== undefined) {
               // Kept longer than the largest tolerance.
               yield* sql`
                 DELETE FROM scheduled_task_webhook_sender_deliveries
                 WHERE seen_at < ${iso(DateTime.subtract(now, { hours: 48 }))}
               `.pipe(Effect.ignore);
             }
-            yield* log("accepted", {
-              signatureVerified: signature !== null,
-              missing: rendered.missing,
-              renderedPrompt: rendered.prompt,
-            }).pipe(Effect.onError(() => release));
             yield* observe("accepted");
             const permit = yield* webhookPermit(task.id);
             const runOutcome = (outcome: "started" | "skipped" | "failed") =>

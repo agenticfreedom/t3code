@@ -13,6 +13,7 @@ import * as Metric from "effect/Metric";
 import * as Queue from "effect/Queue";
 import * as EffectScheduler from "effect/Scheduler";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
@@ -70,7 +71,7 @@ const withService = <A, E>(
     readonly launches: Queue.Queue<LaunchInput>;
     /** Secrets the user entered for an agent, by ref; consuming one removes it. */
     readonly secretsByRef: Map<string, string>;
-  }) => Effect.Effect<A, E, never>,
+  }) => Effect.Effect<A, E, SqlClient.SqlClient>,
   options: { readonly gate?: Deferred.Deferred<void>; readonly relayHookBaseUrl?: string } = {},
 ) =>
   Effect.gen(function* () {
@@ -962,6 +963,32 @@ it.effect("refuses a signed timestamp outside the tolerance", () =>
         }),
       );
       assert.equal(stale._tag, "rejected_signature");
+    }),
+  ),
+);
+
+it.effect("a failed delivery log takes no claim, so the unchanged retry still runs", () =>
+  withService(({ service, launches }) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const { task } = yield* service.upsert(
+        yield* webhookTaskInput({
+          schedule: { type: "webhook", signature: { ...stripeSignature, secret: "s3cret" } },
+        }),
+      );
+      const request = requestFor(task, {
+        headers: { "x-signature": signTimestamped(yield* nowSeconds) },
+      });
+      yield* sql`
+        CREATE TRIGGER fail_accepted_log BEFORE INSERT ON scheduled_task_webhook_deliveries
+        WHEN NEW.outcome = 'accepted' BEGIN SELECT RAISE(ABORT, 'log unavailable'); END
+      `;
+      const failed = yield* Effect.exit(service.triggerWebhook(request));
+      assert.equal(failed._tag, "Failure");
+      yield* sql`DROP TRIGGER fail_accepted_log`;
+      const retried = yield* service.triggerWebhook(request);
+      assert.equal(retried._tag === "accepted" ? retried.outcome : retried._tag, "accepted");
+      yield* Queue.take(launches);
     }),
   ),
 );
